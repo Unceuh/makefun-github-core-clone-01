@@ -25,7 +25,6 @@ import {
   Store,
   fixedNowIso,
   fixedNowEpoch,
-  parseTree,
   type Issue,
   type PullRequest,
   type Repo,
@@ -307,13 +306,13 @@ function fileEntry(repo: Repo, filePath: string, sha: string, data: Buffer): Rec
 }
 
 function dirListing(store: Store, repo: Repo, treeOid: string, prefix: string): Record<string, unknown>[] {
-  const obj = store.getObject(repo, treeOid);
-  if (obj === null || obj.type !== 'tree') return [];
-  const entries: Record<string, unknown>[] = [];
-  for (const entry of parseTree(obj.data)) {
+  const entries = store.treeOf(repo, treeOid);
+  if (entries === null) return [];
+  const out: Record<string, unknown>[] = [];
+  for (const entry of entries) {
     const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
     const isDir = entry.mode === '40000';
-    entries.push({
+    out.push({
       type: isDir ? 'dir' : 'file',
       size: isDir ? 0 : (store.getObject(repo, entry.oid)?.data.length ?? 0),
       name: entry.name,
@@ -325,7 +324,7 @@ function dirListing(store: Store, repo: Repo, treeOid: string, prefix: string): 
       download_url: isDir ? null : `https://github.example/${repo.owner}/${repo.name}/raw/main/${path}`,
     });
   }
-  return entries;
+  return out;
 }
 
 // -- pagination --------------------------------------------------------------
@@ -382,6 +381,8 @@ function parseJsonBody(body: Buffer): { ok: true; value: Record<string, unknown>
 }
 
 function decodeSegment(segment: string): string {
+  // Most segments carry no escapes: skip decodeURIComponent entirely.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {

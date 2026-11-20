@@ -28,9 +28,7 @@
 import { deflateSync, inflateSync } from 'node:zlib';
 import {
   ZERO_OID,
-  buildTree,
-  parseCommit,
-  parseTree,
+  hashObject,
   sha1Of,
   type GitObject,
   type ObjType,
@@ -155,8 +153,7 @@ export function readPack(buf: Buffer): Map<string, GitObject> {
       : deflatedLength(buf.subarray(offset), size);
     if (data.length !== size) throw new Error('pack object size mismatch');
     offset += used;
-    const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-    const oid = sha1Of(Buffer.concat([header, data]));
+    const oid = hashObject(type, data);
     out.set(oid, { type, data });
   }
   return out;
@@ -193,18 +190,21 @@ function deflatedLength(buf: Buffer, expectedSize: number): number {
 export function closureOf(store: Store, repo: Repo, root: string): Map<string, GitObject> {
   const out = new Map<string, GitObject>();
   const queue: string[] = [root];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++] as string;
     if (out.has(oid)) continue;
     const obj = store.getObject(repo, oid);
     if (obj === null) continue;
     out.set(oid, obj);
     if (obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
+      const commit = store.getCommit(repo, oid);
+      if (commit === null) continue;
       queue.push(commit.tree);
       for (const parent of commit.parents) queue.push(parent);
     } else if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) queue.push(entry.oid);
+      const entries = store.treeOf(repo, oid);
+      if (entries !== null) for (const entry of entries) queue.push(entry.oid);
     } else if (obj.type === 'tag') {
       const text = obj.data.toString('utf8');
       const match = text.match(/^object ([0-9a-f]{40})$/m);
@@ -241,14 +241,16 @@ export function depthWalk(
   const boundary: string[] = [];
   const queue: { oid: string; remaining: number }[] = [{ oid: tip, remaining: depth }];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const { oid, remaining } = queue.shift() as { oid: string; remaining: number };
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, remaining } = queue[head++] as { oid: string; remaining: number };
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = store.getObject(repo, oid);
     if (obj === null) continue;
     if (obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
+      const commit = store.getCommit(repo, oid);
+      if (commit === null) continue;
       objects.set(oid, obj);
       for (const [entryOid, entryObj] of closureOf(store, repo, commit.tree)) {
         if (!objects.has(entryOid)) objects.set(entryOid, entryObj);
@@ -304,18 +306,50 @@ export function advertiseV0(repo: Repo, service: 'upload-pack' | 'receive-pack')
   return Buffer.concat(chunks);
 }
 
-/** The v2 capability advertisement for git-upload-pack. */
+/** The v2 capability advertisement for git-upload-pack. It never changes, so it is built once. */
+const ADVERTISE_V2: Buffer = Buffer.concat([
+  pkt('# service=git-upload-pack\n'),
+  FLUSH,
+  pkt('version 2\n'),
+  pkt('fetch=shallow filter\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('object-format=sha1\n'),
+  pkt('agent=makefun-git-forge/1.0\n'),
+  FLUSH,
+]);
+
 export function advertiseV2(): Buffer {
-  return Buffer.concat([
-    pkt('# service=git-upload-pack\n'),
-    FLUSH,
-    pkt('version 2\n'),
-    pkt('fetch=shallow filter\n'),
-    pkt('ls-refs=unborn\n'),
-    pkt('object-format=sha1\n'),
-    pkt('agent=makefun-git-forge/1.0\n'),
-    FLUSH,
-  ]);
+  return ADVERTISE_V2;
+}
+
+/**
+ * Memoised depth-1 fetch responses. A shallow fetch of one tip with no
+ * haves and no client shallow boundary is fully determined by the tip:
+ * the objects are content-addressed and immutable, the boundary is the
+ * tip itself, and the framing is fixed. The same tip therefore always
+ * yields the same bytes, in any repository, so one bounded cache keyed by
+ * protocol + tip is sound. Anything else (deeper fetch, haves, multiple
+ * wants) is computed fresh every time.
+ */
+const FETCH_CACHE_MAX = 64;
+const fetchCache = new Map<string, Buffer>();
+
+function fetchCacheGet(key: string): Buffer | null {
+  return fetchCache.get(key) ?? null;
+}
+
+function fetchCacheSet(key: string, value: Buffer): void {
+  if (fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next().value as string | undefined;
+    if (oldest !== undefined) fetchCache.delete(oldest);
+  }
+  fetchCache.set(key, value);
+}
+
+/** The cache key for a memoised fetch, or null when the fetch is not memoised. */
+function fetchCacheKey(protocol: 'v0' | 'v2', wants: string[], haves: Set<string>, depth: number | null, clientShallow: string[]): string | null {
+  if (wants.length !== 1 || haves.size !== 0 || clientShallow.length !== 0 || depth !== 1) return null;
+  return `${protocol}:${wants[0] as string}`;
 }
 
 /**
@@ -395,6 +429,11 @@ function handleUploadPackV2(store: Store, repo: Repo, packets: Packet[]): Buffer
       else if (line.startsWith('shallow ')) clientShallow.push(line.slice(8).trim());
       else if (line.startsWith('deepen ')) depth = Number.parseInt(line.slice(7).trim(), 10);
     }
+    const cacheKey = fetchCacheKey('v2', wants, haves, depth, clientShallow);
+    if (cacheKey !== null) {
+      const cached = fetchCacheGet(cacheKey);
+      if (cached !== null) return cached;
+    }
     const { objects, shallow, unshallow } = computeFetch(store, repo, wants, haves, depth, clientShallow);
     const pack = writePack([...objects.values()]);
     const chunks: Buffer[] = [];
@@ -418,7 +457,9 @@ function handleUploadPackV2(store: Store, repo: Repo, packets: Packet[]): Buffer
       }
     }
     chunks.push(FLUSH);
-    return Buffer.concat(chunks);
+    const out = Buffer.concat(chunks);
+    if (cacheKey !== null) fetchCacheSet(cacheKey, out);
+    return out;
   }
   throw new Error(`unsupported v2 command ${command}`);
 }
@@ -440,15 +481,17 @@ function heldClosure(
   const out = new Map<string, GitObject>();
   const queue: string[] = [...haves];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = store.getObject(repo, oid);
     if (obj === null) continue;
     out.set(oid, obj);
     if (obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
+      const commit = store.getCommit(repo, oid);
+      if (commit === null) continue;
       for (const [entryOid, entryObj] of closureOf(store, repo, commit.tree)) {
         if (!out.has(entryOid)) out.set(entryOid, entryObj);
       }
@@ -456,7 +499,8 @@ function heldClosure(
         for (const parent of commit.parents) queue.push(parent);
       }
     } else if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) queue.push(entry.oid);
+      const entries = store.treeOf(repo, oid);
+      if (entries !== null) for (const entry of entries) queue.push(entry.oid);
     } else if (obj.type === 'tag') {
       const match = obj.data.toString('utf8').match(/^object ([0-9a-f]{40})$/m);
       if (match !== null) queue.push(match[1] as string);
@@ -501,7 +545,8 @@ export function computeFetch(
     if (!candidates.has(oid) || shallow.includes(oid)) continue;
     const obj = store.getObject(repo, oid);
     if (obj === null || obj.type !== 'commit') continue;
-    const commit = parseCommit(obj.data);
+    const commit = store.getCommit(repo, oid);
+    if (commit === null) continue;
     if (commit.parents.length === 0) continue;
     const delivered = commit.parents.every((p) => objects.has(p) || haveClosure.has(p));
     if (delivered) unshallow.push(oid);
@@ -534,6 +579,11 @@ function handleUploadPackV0(
     else if (line.startsWith('deepen ')) depth = Number.parseInt(line.slice(7).trim(), 10);
     else if (line === 'done') break;
   }
+  const cacheKey = fetchCacheKey('v0', wants, haves, depth, clientShallow);
+  if (cacheKey !== null) {
+    const cached = fetchCacheGet(cacheKey);
+    if (cached !== null) return cached;
+  }
   const { objects, shallow, unshallow } = computeFetch(store, repo, wants, haves, depth, clientShallow);
   const pack = writePack([...objects.values()]);
   const chunks: Buffer[] = [pkt('NAK\n')];
@@ -545,7 +595,9 @@ function handleUploadPackV0(
     }
   }
   chunks.push(FLUSH);
-  return Buffer.concat(chunks);
+  const out = Buffer.concat(chunks);
+  if (cacheKey !== null) fetchCacheSet(cacheKey, out);
+  return out;
 }
 
 // -- protocol v0 receive-pack ----------------------------------------------

@@ -33,7 +33,8 @@ export function sha1Of(buffer: Buffer): string {
 /** The git object id of a (type, data) pair. */
 export function hashObject(type: ObjType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1Of(Buffer.concat([header, data]));
+  // Feed the header and the data as two updates: no copy of the data is made.
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -196,6 +197,15 @@ export class Store {
   issueIdSeq = 0;
   commentIdSeq = 0;
   pullIdSeq = 0;
+  /**
+   * Parsed commits and trees, keyed by oid. Objects are content-addressed
+   * and never overwritten once stored (putObject only adds), so a parsed
+   * form stays valid for the life of the store. This turns repeated walks
+   * over the same history (fast-forward checks, closures, diffs) from
+   * re-parse-every-time into map lookups.
+   */
+  commitCache = new Map<string, ParsedCommit>();
+  treeCache = new Map<string, TreeEntry[]>();
 
   key(owner: string, name: string): string {
     return `${owner}/${name}`;
@@ -245,9 +255,28 @@ export class Store {
   }
 
   getCommit(repo: Repo, oid: string): ParsedCommit | null {
+    const cached = this.commitCache.get(oid);
+    if (cached !== undefined) return cached;
     const obj = this.getObject(repo, oid);
     if (obj === null || obj.type !== 'commit') return null;
-    return parseCommit(obj.data);
+    const parsed = parseCommit(obj.data);
+    this.commitCache.set(oid, parsed);
+    return parsed;
+  }
+
+  /**
+   * A tree's entries, cached by oid. Callers must treat the returned array
+   * as read-only: setPath copies it before mutating. Returns null when the
+   * oid is not a tree.
+   */
+  treeOf(repo: Repo, oid: string): TreeEntry[] | null {
+    const cached = this.treeCache.get(oid);
+    if (cached !== undefined) return cached;
+    const obj = this.getObject(repo, oid);
+    if (obj === null || obj.type !== 'tree') return null;
+    const entries = parseTree(obj.data);
+    this.treeCache.set(oid, entries);
+    return entries;
   }
 
   /** Set (or delete) a ref. */
@@ -270,8 +299,10 @@ export class Store {
     const out: string[] = [];
     const seen = new Set<string>();
     const queue: string[] = [tip];
-    while (queue.length > 0 && out.length < limit) {
-      const oid = queue.shift() as string;
+    // Index-based queue: shift() would move the whole array on every pop.
+    let head = 0;
+    while (head < queue.length && out.length < limit) {
+      const oid = queue[head++] as string;
       if (seen.has(oid)) continue;
       seen.add(oid);
       const commit = this.getCommit(repo, oid);
@@ -297,17 +328,32 @@ export class Store {
 
   isAncestor(repo: Repo, ancestor: string, tip: string): boolean {
     if (ancestor === tip) return true;
-    const walk = this.commitWalk(repo, tip);
-    return walk.includes(ancestor);
+    // Depth-first with an early exit: a fast-forward check usually finds
+    // the old tip one generation back, so there is no need to walk the
+    // whole history the way commitWalk would.
+    const seen = new Set<string>();
+    const stack: string[] = [tip];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const commit = this.getCommit(repo, oid);
+      if (commit === null) continue;
+      for (const parent of commit.parents) {
+        if (parent === ancestor) return true;
+        if (!seen.has(parent)) stack.push(parent);
+      }
+    }
+    return false;
   }
 
   /** Flatten a tree to path -> {oid, mode}. */
   flattenTree(repo: Repo, treeOid: string | null, prefix = ''): Map<string, { oid: string; mode: string }> {
     const out = new Map<string, { oid: string; mode: string }>();
     if (treeOid === null) return out;
-    const obj = this.getObject(repo, treeOid);
-    if (obj === null || obj.type !== 'tree') return out;
-    for (const entry of parseTree(obj.data)) {
+    const entries = this.treeOf(repo, treeOid);
+    if (entries === null) return out;
+    for (const entry of entries) {
       const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
       if (entry.mode === '40000') {
         for (const [p, v] of this.flattenTree(repo, entry.oid, path)) out.set(p, v);
@@ -334,9 +380,9 @@ export class Store {
   subtreeAt(repo: Repo, treeOid: string | null, segments: string[]): string | null {
     if (treeOid === null) return null;
     if (segments.length === 0) return treeOid;
-    const obj = this.getObject(repo, treeOid);
-    if (obj === null || obj.type !== 'tree') return null;
-    for (const entry of parseTree(obj.data)) {
+    const entries = this.treeOf(repo, treeOid);
+    if (entries === null) return null;
+    for (const entry of entries) {
       if (entry.name === segments[0] && entry.mode === '40000') {
         return this.subtreeAt(repo, entry.oid, segments.slice(1));
       }
@@ -350,11 +396,8 @@ export class Store {
    * intermediate directories as needed.
    */
   setPath(repo: Repo, treeOid: string | null, segments: string[], blobOid: string | null): string {
-    const entries: TreeEntry[] = [];
-    if (treeOid !== null) {
-      const obj = this.getObject(repo, treeOid);
-      if (obj !== null && obj.type === 'tree') entries.push(...parseTree(obj.data));
-    }
+    // Copy the cached entries: the array below is mutated in place.
+    const entries: TreeEntry[] = treeOid === null ? [] : [...(this.treeOf(repo, treeOid) ?? [])];
     const [head, ...rest] = segments as [string, ...string[]];
     const idx = entries.findIndex((e) => e.name === head);
     if (rest.length === 0) {
@@ -382,9 +425,9 @@ export class Store {
   }
 
   isTreeEmpty(repo: Repo, treeOid: string): boolean {
-    const obj = this.getObject(repo, treeOid);
-    if (obj === null || obj.type !== 'tree') return false;
-    return parseTree(obj.data).length === 0;
+    const entries = this.treeOf(repo, treeOid);
+    if (entries === null) return false;
+    return entries.length === 0;
   }
 
   /**
